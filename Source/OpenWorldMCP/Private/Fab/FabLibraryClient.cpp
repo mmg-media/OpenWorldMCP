@@ -9,13 +9,11 @@
 #include "HttpModule.h"
 #include "Interfaces/IHttpRequest.h"
 #include "Interfaces/IHttpResponse.h"
-#include "HttpManager.h"
 #include "Dom/JsonObject.h"
 #include "Dom/JsonValue.h"
 #include "Serialization/JsonReader.h"
 #include "Serialization/JsonSerializer.h"
 #include "HAL/PlatformProcess.h"
-#include "HAL/PlatformTime.h"
 
 // ---------------------------------------------------------------------------
 // FFabLibraryAsset helpers
@@ -98,62 +96,11 @@ FString FFabLibraryAsset::ArtifactIdForEngine(const FString& EngineVersion) cons
 }
 
 // ---------------------------------------------------------------------------
-// Synchronous, bounded HTTP GET (uses a shared state so a timed-out request's
-// completion lambda never touches freed stack).
+// Parsing helpers (shared by every page of the feed)
 // ---------------------------------------------------------------------------
 
 namespace
 {
-	struct FHttpState
-	{
-		bool bDone = false;
-		bool bOk = false;
-		int32 Code = 0;
-		FString Body;
-	};
-
-	bool SyncGet(const FString& Url, const FString& Bearer, double TimeoutSeconds, int32& OutCode, FString& OutBody)
-	{
-		TSharedPtr<FHttpState, ESPMode::ThreadSafe> St = MakeShared<FHttpState, ESPMode::ThreadSafe>();
-
-		TSharedRef<IHttpRequest, ESPMode::ThreadSafe> Req = FHttpModule::Get().CreateRequest();
-		Req->SetVerb(TEXT("GET"));
-		Req->SetURL(Url);
-		Req->SetHeader(TEXT("accept"), TEXT("application/json"));
-		Req->SetHeader(TEXT("User-Agent"), TEXT("Fab"));
-		Req->SetHeader(TEXT("Authorization"), FString::Printf(TEXT("Bearer %s"), *Bearer));
-		Req->OnProcessRequestComplete().BindLambda(
-			[St](FHttpRequestPtr, FHttpResponsePtr Resp, bool bOk)
-			{
-				St->bDone = true;
-				St->bOk = bOk;
-				if (bOk && Resp.IsValid())
-				{
-					St->Code = Resp->GetResponseCode();
-					St->Body = Resp->GetContentAsString();
-				}
-			});
-		Req->ProcessRequest();
-
-		const double Start = FPlatformTime::Seconds();
-		while (!St->bDone && (FPlatformTime::Seconds() - Start) < TimeoutSeconds)
-		{
-			FHttpModule::Get().GetHttpManager().Tick(0.f);
-			FPlatformProcess::Sleep(0.01f);
-		}
-
-		if (!St->bDone)
-		{
-			Req->CancelRequest();
-			OutCode = 0;
-			OutBody.Reset();
-			return false;
-		}
-		OutCode = St->Code;
-		OutBody = St->Body;
-		return St->bOk;
-	}
-
 	void ParseStringArray(const TSharedPtr<FJsonObject>& Obj, const TCHAR* Field, TArray<FString>& Out)
 	{
 		const TArray<TSharedPtr<FJsonValue>>* Arr = nullptr;
@@ -276,53 +223,152 @@ namespace
 	}
 }
 
-bool FOpenWorldFabLibrary::Fetch(const FString& BaseUrl, const FString& EpicAccountId, const FString& BearerToken,
-                            int32 PageSize, double TimeoutSeconds,
-                            TArray<FFabLibraryAsset>& OutAssets, int32& OutHttpCode, FString& OutError)
+// ---------------------------------------------------------------------------
+// Async, chain-driven HTTP GET. The owned-library feed is paged via cursors.next and each page can
+// take several seconds on fab.com, so fetching is done with the standard async-request pattern (same
+// as the engine Fab plugin's QueueSyncRequest). A single in-flight chain is tracked file-statically;
+// the completion delegate is invoked on the game thread (IHttpRequest delivers that way by default).
+// ---------------------------------------------------------------------------
+
+namespace
 {
-	OutAssets.Reset();
-	OutHttpCode = 0;
+	struct FChainState
+	{
+		FString BaseUrl;
+		FString EpicAccountId;
+		FString Bearer;
+		int32 PageSize = 100;
+		FString Cursor;
+		TArray<FFabLibraryAsset> Assets;
+		int32 HttpCode = 0;
+		bool bActive = false;
+		bool bRetriedThisPage = false;
+		bool bHasRequestedPage = false;
+	};
+
+	FChainState& Chain()
+	{
+		static FChainState State;
+		return State;
+	}
+
+	void ContinueChain(FOpenWorldFabLibrary::FOpenWorldFabLibraryDone OnDone);
+
+	// Begin the next page request, or finish the chain when the cursor is exhausted. The FIRST page
+	// is requested with an empty cursor (that's how the feed starts); only after at least one page
+	// does an empty cursor mean "no more pages".
+	void StartNextPage(FOpenWorldFabLibrary::FOpenWorldFabLibraryDone OnDone)
+	{
+		FChainState& C = Chain();
+		if (C.bHasRequestedPage && C.Cursor.IsEmpty())
+		{
+			C.bActive = false;
+			if (OnDone) { OnDone(true, MoveTemp(C.Assets), FString()); }
+			return;
+		}
+		C.bHasRequestedPage = true;
+
+		TSharedRef<IHttpRequest, ESPMode::ThreadSafe> Req = FHttpModule::Get().CreateRequest();
+		Req->SetVerb(TEXT("GET"));
+		Req->SetURL(OpenWorldMCP::Fab::LibraryUrl(C.BaseUrl, C.EpicAccountId, C.PageSize, C.Cursor));
+		Req->SetHeader(TEXT("accept"), TEXT("application/json"));
+		Req->SetHeader(TEXT("User-Agent"), TEXT("Fab"));
+		Req->SetHeader(TEXT("Authorization"), FString::Printf(TEXT("Bearer %s"), *C.Bearer));
+		Req->OnProcessRequestComplete().BindLambda(
+			[OnDone](FHttpRequestPtr, FHttpResponsePtr Resp, bool bOk)
+			{
+				FChainState& State = Chain();
+				if (!State.bActive)
+				{
+					return;   // cancelled mid-flight — ignore a stale completion
+				}
+
+				int32 Code = 0;
+				FString Body;
+				if (bOk && Resp.IsValid())
+				{
+					Code = Resp->GetResponseCode();
+					Body = Resp->GetContentAsString();
+				}
+				State.HttpCode = Code;
+
+				// Fab intermittently challenges the first headless request (HTTP 403), then accepts the
+				// identical follow-up. Retry exactly once; never loop on a persistent challenge.
+				if (Code == 403 && !State.bRetriedThisPage)
+				{
+					State.bRetriedThisPage = true;
+					ContinueChain(OnDone);
+					return;
+				}
+
+				if (!bOk || Code < 200 || Code >= 300)
+				{
+					State.bActive = false;
+					const FString Err = Code == 401 || Code == 403
+						? FString::Printf(TEXT("Fab library request was rejected (HTTP %d) — the auth token may be expired or lack fab.com scope."), Code)
+						: FString::Printf(TEXT("Fab library request failed (HTTP %d)."), Code);
+					if (OnDone) { OnDone(false, MoveTemp(State.Assets), Err); }
+					return;
+				}
+
+				FString NextCursor;
+				FString ParseErr;
+				if (!ParsePage(Body, State.Assets, NextCursor, ParseErr))
+				{
+					State.bActive = false;
+					if (OnDone) { OnDone(false, MoveTemp(State.Assets), ParseErr); }
+					return;
+				}
+				State.Cursor = NextCursor;
+				State.bRetriedThisPage = false;
+				StartNextPage(OnDone);
+			});
+		Req->ProcessRequest();
+	}
+
+	void ContinueChain(FOpenWorldFabLibrary::FOpenWorldFabLibraryDone OnDone)
+	{
+		StartNextPage(OnDone);
+	}
+}
+
+bool FOpenWorldFabLibrary::IsFetching()
+{
+	return Chain().bActive;
+}
+
+void FOpenWorldFabLibrary::Cancel()
+{
+	Chain().bActive = false;
+}
+
+void FOpenWorldFabLibrary::FetchAsync(const FString& BaseUrl, const FString& EpicAccountId, const FString& BearerToken,
+                                      int32 PageSize, FOpenWorldFabLibraryDone OnDone)
+{
 	if (EpicAccountId.IsEmpty() || BearerToken.IsEmpty())
 	{
-		OutError = TEXT("Missing Epic account id or auth token.");
-		return false;
+		if (OnDone) { OnDone(false, TArray<FFabLibraryAsset>(), TEXT("Missing Epic account id or auth token.")); }
+		return;
 	}
 
-	const double Deadline = FPlatformTime::Seconds() + TimeoutSeconds;
-	FString Cursor;
-	const int32 MaxPages = 100;   // safety cap — 100 * 1000 items is far beyond any real library
-	for (int32 Page = 0; Page < MaxPages; ++Page)
+	FChainState& C = Chain();
+	if (C.bActive)
 	{
-		const double Remaining = Deadline - FPlatformTime::Seconds();
-		if (Remaining <= 0.0)
-		{
-			OutError = TEXT("Timed out fetching the Fab library.");
-			return false;
-		}
-		const FString Url = OpenWorldMCP::Fab::LibraryUrl(BaseUrl, EpicAccountId, PageSize, Cursor);
-		FString Body;
-		const bool bOk = SyncGet(Url, BearerToken, Remaining, OutHttpCode, Body);
-		if (!bOk || OutHttpCode < 200 || OutHttpCode >= 300)
-		{
-			OutError = OutHttpCode == 401 || OutHttpCode == 403
-				? FString::Printf(TEXT("Fab library request was rejected (HTTP %d) — the auth token may be expired or lack fab.com scope."), OutHttpCode)
-				: FString::Printf(TEXT("Fab library request failed (HTTP %d)."), OutHttpCode);
-			return false;
-		}
-
-		FString NextCursor;
-		if (!ParsePage(Body, OutAssets, NextCursor, OutError))
-		{
-			return false;
-		}
-		if (NextCursor.IsEmpty())
-		{
-			break;
-		}
-		Cursor = NextCursor;
+		return;   // a fetch is already running; the caller should poll IsFetching() instead
 	}
 
-	return true;
+	C = FChainState();
+	C.BaseUrl = BaseUrl;
+	C.EpicAccountId = EpicAccountId;
+	C.Bearer = BearerToken;
+	C.PageSize = PageSize > 0 ? PageSize : 100;
+	C.bActive = true;
+	C.bRetriedThisPage = false;
+	C.bHasRequestedPage = false;
+
+	// The first request uses an empty cursor; the chain reads the next cursor from each page's
+	// response and continues until the feed reports none.
+	StartNextPage(OnDone);
 }
 
 #endif // WITH_OPENWORLD_FAB

@@ -44,25 +44,34 @@ struct FFabLibraryAsset
 };
 
 /**
- * Fetches the signed-in account's owned Fab library synchronously (bounded), paging via cursors.next.
- * Mirrors the engine Fab plugin's request exactly (FabMyFolderIntegration.cpp): GET
- * {base}/e/accounts/{id}/ue/library?count=N, headers accept + Bearer.
+ * Fetches the signed-in account's owned Fab library asynchronously, paging via cursors.next.
+ * Mirrors the engine Fab plugin's request (FabMyFolderIntegration.cpp): GET
+ * {base}/e/accounts/{id}/ue/library?count=N, headers accept + Bearer. Because the owned-library
+ * feed can be large (hundreds of assets → many pages, each page taking several seconds), the fetch
+ * runs in the background using the same async-request pattern as the engine plugin; callers poll via
+ * IsFetching() and take the result from FetchAsync's completion delegate.
  */
 class FOpenWorldFabLibrary
 {
 public:
+	/** Completion callback: (bOk, assets, error). Delivered on the game thread. */
+	using FOpenWorldFabLibraryDone = TFunction<void(bool /*bOk*/, TArray<FFabLibraryAsset> /*Assets*/, FString /*Error*/)>;
+
 	/**
-	 * @param BaseUrl        e.g. https://fab.com
+	 * Begin fetching the library. Idempotent per session: if a fetch is already running this is a no-op
+	 * (the existing fetch's completion callback still fires). Results are delivered on the game thread.
+	 * @param BaseUrl        e.g. https://www.fab.com
 	 * @param EpicAccountId  stringified EOS account id
 	 * @param BearerToken    EOS access token
-	 * @param PageSize       'count' per request (engine default 1000)
-	 * @param TimeoutSeconds overall budget across all pages
-	 * @param OutAssets      parsed library
-	 * @param OutHttpCode    last HTTP status (for diagnostics; 200 on success)
-	 * @param OutError       set on failure
-	 * @return true on success (an empty library is success)
+	 * @param PageSize       'count' per request (100 keeps single pages fast — the feed is slow)
+	 * @param OnDone         completion callback (bOk, assets, error)
 	 */
-	static bool Fetch(const FString& BaseUrl, const FString& EpicAccountId, const FString& BearerToken,
-	                  int32 PageSize, double TimeoutSeconds,
-	                  TArray<FFabLibraryAsset>& OutAssets, int32& OutHttpCode, FString& OutError);
+	static void FetchAsync(const FString& BaseUrl, const FString& EpicAccountId, const FString& BearerToken,
+	                       int32 PageSize, FOpenWorldFabLibraryDone OnDone);
+
+	/** True while a library fetch is in flight. */
+	static bool IsFetching();
+
+	/** Cancels an in-flight fetch; the completion delegate will not fire. */
+	static void Cancel();
 };

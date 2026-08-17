@@ -124,26 +124,45 @@ static bool RequireAuth(double TimeoutSeconds, FString& OutErr)
 	return true;
 }
 
-// Fill the in-process cache if needed.
-static bool EnsureLibrary(bool bRefresh, FString& OutErr)
+// Fill the in-process cache if needed. Returns: 1 = data ready (or fetch started/loading), 0 = a
+// fetch is already in flight (caller should return a "loading" response), -1 = hard failure (OutErr set).
+static int32 EnsureLibrary(bool bRefresh, FString& OutErr)
 {
 	if (GLibraryCached && !bRefresh)
 	{
-		return true;
+		return 1;
 	}
+
+	if (FOpenWorldFabLibrary::IsFetching())
+	{
+		return 0;   // fetch already running — report loading
+	}
+
 	const FString Token = FOpenWorldFabAuth::GetAccessToken();
 	const FString Account = FOpenWorldFabAuth::GetEpicAccountId();
-	int32 HttpCode = 0;
-	FString Err;
-	TArray<FFabLibraryAsset> Fetched;
-	if (!FOpenWorldFabLibrary::Fetch(BaseUrl(), Account, Token, /*PageSize*/ 1000, /*Timeout*/ 45.0, Fetched, HttpCode, Err))
+	if (Account.IsEmpty() || Token.IsEmpty())
 	{
-		OutErr = ErrJson(HttpCode == 401 || HttpCode == 403 ? TEXT("AUTH_REJECTED") : TEXT("LIBRARY_FETCH_FAILED"), Err);
-		return false;
+		OutErr = ErrJson(TEXT("NOT_AUTHENTICATED"), TEXT("No Epic access token is available; sign into Fab and retry."));
+		return -1;
 	}
-	GLibraryCache = MoveTemp(Fetched);
-	GLibraryCached = true;
-	return true;
+
+	// Kick off an async fetch; the completion lambda fills the cache on the game thread. The lambda
+	// must not capture by reference — it runs after this function has returned.
+	FOpenWorldFabLibrary::FetchAsync(BaseUrl(), Account, Token, /*PageSize*/ 100,
+		[](bool bOk, TArray<FFabLibraryAsset> Assets, FString Err)
+		{
+			if (bOk)
+			{
+				GLibraryCache = MoveTemp(Assets);
+				GLibraryCached = true;
+			}
+			else
+			{
+				UE_LOG(LogOpenWorldFab, Warning, TEXT("Library refresh failed: %s"), *Err);
+				GLibraryCached = false;
+			}
+		});
+	return 0;   // loading — caller should poll again
 }
 
 static const FFabLibraryAsset* FindAsset(const FString& AssetId)
@@ -219,9 +238,21 @@ FString UOpenWorldFabService::ListLibrary(const FString& NameFilter, const FStri
 		return AuthErr;
 	}
 	FString LibErr;
-	if (!EnsureLibrary(Refresh, LibErr))
+	const int32 LibStatus = EnsureLibrary(Refresh, LibErr);
+	if (LibStatus < 0)
 	{
 		return LibErr;
+	}
+	if (LibStatus == 0)
+	{
+		TSharedPtr<FJsonObject> Obj = MakeShared<FJsonObject>();
+		Obj->SetBoolField(TEXT("success"), true);
+		Obj->SetStringField(TEXT("status"), TEXT("loading"));
+		Obj->SetStringField(TEXT("message"), TEXT("Library refresh in progress — call list_library again in a few seconds (Refresh=false) to retrieve the results."));
+		FString Out;
+		TSharedRef<TJsonWriter<>> W = TJsonWriterFactory<>::Create(&Out);
+		FJsonSerializer::Serialize(Obj.ToSharedRef(), W);
+		return Out;
 	}
 
 	// "all"/"any" disables the engine-version filter; anything else (or empty = current engine) excludes
@@ -304,9 +335,14 @@ FString UOpenWorldFabService::GetAsset(const FString& AssetId)
 		return AuthErr;
 	}
 	FString LibErr;
-	if (!EnsureLibrary(false, LibErr))
+	const int32 LibStatus = EnsureLibrary(false, LibErr);
+	if (LibStatus < 0)
 	{
 		return LibErr;
+	}
+	if (LibStatus == 0)
+	{
+		return ErrJson(TEXT("LIBRARY_LOADING"), TEXT("The owned library is still refreshing — call list_library once to wait for it, then retry get_asset."));
 	}
 
 	const FFabLibraryAsset* A = FindAsset(AssetId);
@@ -433,9 +469,14 @@ FString UOpenWorldFabService::ImportAsset(const FString& AssetId, const FString&
 		return AuthErr;
 	}
 	FString LibErr;
-	if (!EnsureLibrary(false, LibErr))
+	const int32 LibStatus = EnsureLibrary(false, LibErr);
+	if (LibStatus < 0)
 	{
 		return LibErr;
+	}
+	if (LibStatus == 0)
+	{
+		return ErrJson(TEXT("LIBRARY_LOADING"), TEXT("The owned library is still refreshing — call list_library once to wait for it, then retry import_asset."));
 	}
 	const FFabLibraryAsset* A = FindAsset(AssetId);
 	if (!A)
