@@ -13,6 +13,7 @@
 #include "Landscape.h"
 #include "LandscapeInfo.h"
 #include "LandscapeEdit.h"
+#include "LandscapeEditLayer.h"
 #include "LandscapeLayerInfoObject.h"
 #include "UObject/SavePackage.h"
 #include "LandscapeDataAccess.h"
@@ -32,6 +33,41 @@ static FOpenWorldMaterialResult MaterialOk(const FString& AssetPath = TEXT(""))
 	Result.bSuccess = true;
 	Result.AssetPath = AssetPath;
 	return Result;
+}
+
+namespace
+{
+	/** The active edit-layer GUID that layer edits are written to. */
+	FGuid ResolveTargetLayer(ALandscape* Landscape)
+	{
+		FGuid LayerGuid = Landscape->GetEditingLayer();
+		if (!LayerGuid.IsValid())
+		{
+			const TArray<ULandscapeEditLayerBase*> Layers = Landscape->GetEditLayers();
+			if (Layers.Num() > 0 && Layers[0])
+			{
+				LayerGuid = Layers[0]->GetGuid();
+			}
+		}
+		return LayerGuid;
+	}
+
+	/** Pushes pending weightmap updates so the painted weights become visible. */
+	void FlushWeightmapEdits(ALandscape* Landscape)
+	{
+		if (!Landscape)
+		{
+			return;
+		}
+
+		if (ALandscape* MainActor = Landscape->GetLandscapeActor())
+		{
+			MainActor->ForceUpdateLayersContent();
+		}
+
+		Landscape->RequestLayersContentUpdate(ELandscapeLayerUpdateMode::Update_Weightmap_All);
+		Landscape->PostEditChange();
+	}
 }
 
 ALandscape* UOpenWorldLandscapeMaterialService::FindLandscape(const FString& LandscapeName)
@@ -263,15 +299,21 @@ FOpenWorldMaterialResult UOpenWorldLandscapeMaterialService::PaintLayerRect(
 	const FVector Origin = Landscape->GetActorLocation();
 	const FVector Scale = Landscape->GetActorScale3D();
 
-	FVector BoundsOrigin(ForceInit), BoxExtent(ForceInit);
-	Landscape->GetActorBounds(false, BoundsOrigin, BoxExtent);
-	const int32 MaxX = FMath::Max(0, FMath::RoundToInt(((BoundsOrigin.X + BoxExtent.X) - Origin.X) / FMath::Max(Scale.X, 0.01f)));
-	const int32 MaxY = FMath::Max(0, FMath::RoundToInt(((BoundsOrigin.Y + BoxExtent.Y) - Origin.Y) / FMath::Max(Scale.Y, 0.01f)));
+	int32 LandMinX, LandMinY, LandMaxX, LandMaxY;
+	if (!Info->GetLandscapeExtent(LandMinX, LandMinY, LandMaxX, LandMaxY))
+	{
+		return MaterialError(TEXT("Could not resolve landscape extent"));
+	}
 
-	const int32 X1 = FMath::Clamp(FMath::RoundToInt((WorldMinX - Origin.X) / FMath::Max(Scale.X, 0.01f)), 0, MaxX);
-	const int32 Y1 = FMath::Clamp(FMath::RoundToInt((WorldMinY - Origin.Y) / FMath::Max(Scale.Y, 0.01f)), 0, MaxY);
-	const int32 X2 = FMath::Clamp(FMath::RoundToInt((WorldMaxX - Origin.X) / FMath::Max(Scale.X, 0.01f)), 0, MaxX);
-	const int32 Y2 = FMath::Clamp(FMath::RoundToInt((WorldMaxY - Origin.Y) / FMath::Max(Scale.Y, 0.01f)), 0, MaxY);
+	const int32 X1 = FMath::Clamp(FMath::FloorToInt((WorldMinX - Origin.X) / FMath::Max(Scale.X, 0.01f)), LandMinX, LandMaxX);
+	const int32 Y1 = FMath::Clamp(FMath::FloorToInt((WorldMinY - Origin.Y) / FMath::Max(Scale.Y, 0.01f)), LandMinY, LandMaxY);
+	const int32 X2 = FMath::Clamp(FMath::CeilToInt((WorldMaxX - Origin.X) / FMath::Max(Scale.X, 0.01f)), LandMinX, LandMaxX);
+	const int32 Y2 = FMath::Clamp(FMath::CeilToInt((WorldMaxY - Origin.Y) / FMath::Max(Scale.Y, 0.01f)), LandMinY, LandMaxY);
+
+	if (X1 > X2 || Y1 > Y2)
+	{
+		return MaterialError(TEXT("Invalid paint region"));
+	}
 
 	const int32 Width = X2 - X1 + 1;
 	const int32 Height = Y2 - Y1 + 1;
@@ -282,9 +324,24 @@ FOpenWorldMaterialResult UOpenWorldLandscapeMaterialService::PaintLayerRect(
 	const uint8 WeightValue = static_cast<uint8>(FMath::Clamp(Weight, 0.f, 1.f) * 255.f);
 	FMemory::Memset(Data.GetData(), WeightValue, Data.Num());
 
-	TAlphamapAccessor<true> Accessor(Info, LayerInfo);
+	const FGuid LayerGuid = ResolveTargetLayer(Landscape);
+
+	FScopedSetLandscapeEditingLayer EditScope(
+		Landscape,
+		LayerGuid,
+		[Landscape]()
+		{
+			if (Landscape)
+			{
+				Landscape->RequestLayersContentUpdate(ELandscapeLayerUpdateMode::Update_Weightmap_All);
+			}
+		});
+
+	TAlphamapAccessor<false> Accessor(Info, LayerInfo);
 	Accessor.SetData(X1, Y1, X2, Y2, Data.GetData(), ELandscapeLayerPaintingRestriction::None);
 	Accessor.Flush();
+
+	FlushWeightmapEdits(Landscape);
 
 	Landscape->MarkPackageDirty();
 	return MaterialOk(LayerPath);
