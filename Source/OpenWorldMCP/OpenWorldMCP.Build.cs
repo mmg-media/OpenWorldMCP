@@ -23,6 +23,7 @@ public class OpenWorldMCP : ModuleRules
 			new string[]
 			{
 				"UnrealEd",
+				"EditorFramework",
 				"EditorScriptingUtilities",
 				"Landscape",
 				"LandscapeEditor",
@@ -32,7 +33,11 @@ public class OpenWorldMCP : ModuleRules
 				"AssetTools",
 				"PythonScriptPlugin",
 				"Slate",
-				"SlateCore"
+				"SlateCore",
+				"InputCore",
+				"LevelEditor",
+				"Json",
+				"JsonUtilities"
 			}
 		);
 

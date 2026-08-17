@@ -4,6 +4,8 @@
 #include "ToolsetRegistry/UToolsetRegistry.h"
 #include "UObject/UObjectIterator.h"
 #include "OpenWorldFoliageService.h"
+#include "EditorModeRegistry.h"
+#include "Zone/ZoneMarkMode.h"
 
 #define LOCTEXT_NAMESPACE "FOpenWorldMCPModule"
 
@@ -30,6 +32,11 @@ void FOpenWorldMCPModule::ShutdownModule()
 	}
 
 	UnregisterToolsets();
+
+	if (FEditorModeRegistry::Get().GetFactoryMap().Contains(FOpenWorldZoneMarkMode::EditorModeID))
+	{
+		FEditorModeRegistry::Get().UnregisterMode(FOpenWorldZoneMarkMode::EditorModeID);
+	}
 }
 
 void FOpenWorldMCPModule::RegisterToolsets()
@@ -44,6 +51,14 @@ void FOpenWorldMCPModule::RegisterToolsets()
 	{
 		UE_LOG(LogTemp, Warning, TEXT("OpenWorldMCP: ToolsetRegistry not available; toolsets not registered."));
 		return;
+	}
+
+	// Register the zone marking editor mode (safe to call multiple times; the registry replaces).
+	if (!FEditorModeRegistry::Get().GetFactoryMap().Contains(FOpenWorldZoneMarkMode::EditorModeID))
+	{
+		FEditorModeRegistry::Get().RegisterMode<FOpenWorldZoneMarkMode>(
+			FOpenWorldZoneMarkMode::EditorModeID,
+			FText::FromString(TEXT("Zone Mark")));
 	}
 
 	TArray<UClass*> ToolsetClasses;
