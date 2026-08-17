@@ -88,9 +88,21 @@ public:
 		int32 Seed = 0,
 		const FString& ActorLabel = TEXT("ScatteredMesh"));
 
-private:
-	static class UWorld* GetEditorWorld();
-	static bool TraceToLandscape(class UWorld* World, float X, float Y, FVector& OutLocation, FVector& OutNormal);
+	/**
+	 * Shared scatter implementation used by the foliage and zone toolsets. Generates
+	 * ISM instances from a set of candidate X/Y positions, tracing to the landscape.
+	 *
+	 * @param MeshPath - Path to the UStaticMesh asset
+	 * @param Candidates - Candidate world-space X/Y positions
+	 * @param Count - Number of instances to spawn (clamped to Candidates.Num())
+	 * @param MinScale - Minimum random scale
+	 * @param MaxScale - Maximum random scale
+	 * @param bAlignToNormal - Align instances to the surface normal
+	 * @param bRandomYaw - Random yaw rotation
+	 * @param Seed - Random seed for reproducibility (0 = random)
+	 * @param ActorLabel - Label for the spawned ISM actor
+	 * @return Result with spawned instance count
+	 */
 	static FOpenWorldScatterResult ScatterInternal(
 		const FString& MeshPath,
 		const TArray<FVector2D>& Candidates,
@@ -101,4 +113,8 @@ private:
 		bool bRandomYaw,
 		int32 Seed,
 		const FString& ActorLabel);
+
+private:
+	static class UWorld* GetEditorWorld();
+	static bool TraceToLandscape(class UWorld* World, float X, float Y, FVector& OutLocation, FVector& OutNormal);
 };

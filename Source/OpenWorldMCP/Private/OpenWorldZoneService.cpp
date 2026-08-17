@@ -1,5 +1,6 @@
 #include "OpenWorldZoneService.h"
 
+#include "OpenWorldFoliageService.h"
 #include "Editor.h"
 #include "EditorModeRegistry.h"
 #include "EditorModeManager.h"
@@ -290,4 +291,146 @@ FOpenWorldZoneResult UOpenWorldZoneService::SetTopDownView()
 	}
 	LevelVC->SetViewportType(LVT_Perspective);
 	return ZoneOk(TEXT("Top-down view disabled"));
+}
+
+/**
+ * Ray-casting point-in-polygon test in 2D (X/Y world space).
+ */
+static bool IsPointInPolygon(const FVector2D& Point, const TArray<FVector2D>& Polygon)
+{
+	if (Polygon.Num() < 3)
+	{
+		return false;
+	}
+
+	bool bInside = false;
+	int32 J = Polygon.Num() - 1;
+	for (int32 I = 0; I < Polygon.Num(); ++I)
+	{
+		const FVector2D& A = Polygon[I];
+		const FVector2D& B = Polygon[J];
+		if ((A.Y > Point.Y) != (B.Y > Point.Y) &&
+			Point.X < (B.X - A.X) * (Point.Y - A.Y) / (B.Y - A.Y) + A.X)
+		{
+			bInside = !bInside;
+		}
+		J = I;
+	}
+	return bInside;
+}
+
+static TArray<FVector2D> GenerateZoneCandidates(const AZoneRegionActor* Region, const FRandomStream& Stream, int32 Desired)
+{
+	TArray<FVector2D> Candidates;
+	if (!Region)
+	{
+		return Candidates;
+	}
+
+	const FOpenWorldZone& Z = Region->Zone;
+	if (Z.Points.Num() == 0)
+	{
+		return Candidates;
+	}
+
+	if (!Z.bIsPolygon)
+	{
+		// Rectangle: first point = min, second point = max.
+		const FVector2D Min = Z.Points[0];
+		const FVector2D Max = Z.Points.Num() > 1 ? Z.Points[1] : Min;
+		for (int32 I = 0; I < Desired; ++I)
+		{
+			Candidates.Add(FVector2D(
+				Stream.FRandRange(Min.X, Max.X),
+				Stream.FRandRange(Min.Y, Max.Y)));
+		}
+		return Candidates;
+	}
+
+	// Polygon: generate points inside the bounding box and keep those inside the shape.
+	FBox2D Bounds(ForceInit);
+	for (const FVector2D& P : Z.Points)
+	{
+		Bounds += P;
+	}
+
+	for (int32 I = 0; I < Desired * 4; ++I)
+	{
+		FVector2D Candidate(
+			Stream.FRandRange(Bounds.Min.X, Bounds.Max.X),
+			Stream.FRandRange(Bounds.Min.Y, Bounds.Max.Y));
+		if (IsPointInPolygon(Candidate, Z.Points))
+		{
+			Candidates.Add(Candidate);
+		}
+		if (Candidates.Num() >= Desired)
+		{
+			break;
+		}
+	}
+
+	return Candidates;
+}
+
+FOpenWorldScatterResult UOpenWorldZoneService::ScatterInZone(
+	const FString& MeshPath,
+	const FString& ZoneIdOrLabel,
+	int32 Count,
+	float MinScale,
+	float MaxScale,
+	bool bAlignToNormal,
+	bool bRandomYaw,
+	int32 Seed,
+	const FString& ActorLabel)
+{
+	UWorld* World = GetZoneEditorWorld();
+	if (!World)
+	{
+		FOpenWorldScatterResult R;
+		R.bSuccess = false;
+		R.ErrorMessage = TEXT("No editor world available");
+		return R;
+	}
+
+	if (MeshPath.IsEmpty() || Count <= 0)
+	{
+		FOpenWorldScatterResult R;
+		R.bSuccess = false;
+		R.ErrorMessage = TEXT("MeshPath and Count > 0 required");
+		return R;
+	}
+
+	// Find the zone by id or label (case-insensitive).
+	AZoneRegionActor* Target = nullptr;
+	for (TActorIterator<AZoneRegionActor> It(World); It; ++It)
+	{
+		AZoneRegionActor* Region = *It;
+		if (Region->Zone.Id.Equals(ZoneIdOrLabel, ESearchCase::IgnoreCase) ||
+			Region->Zone.Label.Equals(ZoneIdOrLabel, ESearchCase::IgnoreCase))
+		{
+			Target = Region;
+			break;
+		}
+	}
+
+	if (!Target)
+	{
+		FOpenWorldScatterResult R;
+		R.bSuccess = false;
+		R.ErrorMessage = FString::Printf(TEXT("No zone found with id/label \"%s\""), *ZoneIdOrLabel);
+		return R;
+	}
+
+	FRandomStream Stream(Seed != 0 ? Seed : FMath::Rand());
+	TArray<FVector2D> Candidates = GenerateZoneCandidates(Target, Stream, Count * 2);
+	if (Candidates.Num() == 0)
+	{
+		FOpenWorldScatterResult R;
+		R.bSuccess = false;
+		R.ErrorMessage = TEXT("No positions generated inside the zone");
+		return R;
+	}
+
+	return UOpenWorldFoliageService::ScatterInternal(
+		MeshPath, Candidates, Count, MinScale, MaxScale, bAlignToNormal, bRandomYaw, Seed, ActorLabel);
 }

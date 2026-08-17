@@ -91,6 +91,33 @@ public:
 	UFUNCTION(BlueprintCallable, meta = (AICallable), Category = "OpenWorld|Zone")
 	static FOpenWorldZoneResult SetTopDownView();
 
+	/**
+	 * Scatter static meshes inside a marked zone (rectangle or polygon). Only positions that
+	 * fall inside the zone footprint are used; instances are traced onto the landscape surface.
+	 *
+	 * @param MeshPath - Path to the UStaticMesh asset (e.g. "/PCG/SampleContent/SimpleForest/Meshes/PCG_Tree_01")
+	 * @param ZoneIdOrLabel - Zone id (e.g. "Zone_3") or zone label (e.g. "DorfGebiet")
+	 * @param Count - Number of instances to spawn
+	 * @param MinScale - Minimum random scale
+	 * @param MaxScale - Maximum random scale
+	 * @param bAlignToNormal - Align instances to the surface normal
+	 * @param bRandomYaw - Random yaw rotation
+	 * @param Seed - Random seed for reproducibility (0 = random)
+	 * @param ActorLabel - Label for the spawned ISM actor
+	 * @return Scatter result with spawned instance count
+	 */
+	UFUNCTION(BlueprintCallable, meta = (AICallable), Category = "OpenWorld|Zone")
+	static FOpenWorldScatterResult ScatterInZone(
+		const FString& MeshPath,
+		const FString& ZoneIdOrLabel,
+		int32 Count,
+		float MinScale = 0.8f,
+		float MaxScale = 1.2f,
+		bool bAlignToNormal = true,
+		bool bRandomYaw = true,
+		int32 Seed = 0,
+		const FString& ActorLabel = TEXT("ScatteredMesh"));
+
 private:
 	static class UWorld* GetEditorWorld();
 };
