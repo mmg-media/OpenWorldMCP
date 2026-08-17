@@ -1,0 +1,30 @@
+{
+	"FileVersion": 3,
+	"Version": 1,
+	"VersionName": "1.0",
+	"EngineVersion": "5.8.0",
+	"FriendlyName": "OpenWorldMCP",
+	"Description": "Eigene MCP-Toolsets fuer das OpenWorld-Projekt (Foliage, Ressourcen, Weltbau) - registriert ueber die ToolsetRegistry.",
+	"Category": "Editor",
+	"CreatedBy": "OpenWorld",
+	"CanContainContent": true,
+	"IsBetaVersion": false,
+	"IsExperimentalVersion": false,
+	"Modules": [
+		{
+			"Name": "OpenWorldMCP",
+			"Type": "Editor",
+			"LoadingPhase": "Default"
+		}
+	],
+	"Plugins": [
+		{
+			"Name": "ToolsetRegistry",
+			"Enabled": true
+		},
+		{
+			"Name": "ModelContextProtocol",
+			"Enabled": true
+		}
+	]
+}
