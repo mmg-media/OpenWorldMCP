@@ -1,6 +1,7 @@
 #include "OpenWorldZoneService.h"
 
 #include "OpenWorldFoliageService.h"
+#include "OpenWorldLandscapeService.h"
 #include "Editor.h"
 #include "EditorModeRegistry.h"
 #include "EditorModeManager.h"
@@ -433,4 +434,332 @@ FOpenWorldScatterResult UOpenWorldZoneService::ScatterInZone(
 
 	return UOpenWorldFoliageService::ScatterInternal(
 		MeshPath, Candidates, Count, MinScale, MaxScale, bAlignToNormal, bRandomYaw, Seed, ActorLabel);
+}
+
+static AZoneRegionActor* FindZoneActor(UWorld* World, const FString& ZoneIdOrLabel)
+{
+	if (!World)
+	{
+		return nullptr;
+	}
+	for (TActorIterator<AZoneRegionActor> It(World); It; ++It)
+	{
+		AZoneRegionActor* Region = *It;
+		if (Region->Zone.Id.Equals(ZoneIdOrLabel, ESearchCase::IgnoreCase) ||
+			Region->Zone.Label.Equals(ZoneIdOrLabel, ESearchCase::IgnoreCase))
+		{
+			return Region;
+		}
+	}
+	return nullptr;
+}
+
+FOpenWorldScatterResult UOpenWorldZoneService::ScatterWeightedInZone(
+	const FString& ZoneIdOrLabel,
+	const FString& MeshWeightsCsv,
+	int32 Count,
+	float MinScale,
+	float MaxScale,
+	bool bAlignToNormal,
+	bool bRandomYaw,
+	int32 Seed,
+	const FString& ActorLabel)
+{
+	UWorld* World = GetZoneEditorWorld();
+	if (!World)
+	{
+		FOpenWorldScatterResult R;
+		R.bSuccess = false;
+		R.ErrorMessage = TEXT("No editor world available");
+		return R;
+	}
+
+	if (MeshWeightsCsv.IsEmpty() || Count <= 0)
+	{
+		FOpenWorldScatterResult R;
+		R.bSuccess = false;
+		R.ErrorMessage = TEXT("MeshWeightsCsv and Count > 0 required");
+		return R;
+	}
+
+	AZoneRegionActor* Target = FindZoneActor(World, ZoneIdOrLabel);
+	if (!Target)
+	{
+		FOpenWorldScatterResult R;
+		R.bSuccess = false;
+		R.ErrorMessage = FString::Printf(TEXT("No zone found with id/label \"%s\""), *ZoneIdOrLabel);
+		return R;
+	}
+
+	// Parse "MeshPath1:Weight1;MeshPath2:Weight2;..."
+	TArray<FString> Entries;
+	MeshWeightsCsv.ParseIntoArray(Entries, TEXT(";"), true);
+
+	TArray<FString> MeshPaths;
+	TArray<float> MeshWeights;
+	for (const FString& Entry : Entries)
+	{
+		TArray<FString> Parts;
+		Entry.ParseIntoArray(Parts, TEXT(":"), true);
+		if (Parts.Num() != 2)
+		{
+			continue;
+		}
+		const FString Path = Parts[0].TrimStartAndEnd();
+		const float Weight = FCString::Atof(*Parts[1].TrimStartAndEnd());
+		if (!Path.IsEmpty() && Weight > 0.f)
+		{
+			MeshPaths.Add(Path);
+			MeshWeights.Add(Weight);
+		}
+	}
+
+	if (MeshPaths.Num() == 0)
+	{
+		FOpenWorldScatterResult R;
+		R.bSuccess = false;
+		R.ErrorMessage = TEXT("No valid \"MeshPath:Weight\" entries found");
+		return R;
+	}
+
+	FRandomStream Stream(Seed != 0 ? Seed : FMath::Rand());
+	TArray<FVector2D> Candidates = GenerateZoneCandidates(Target, Stream, Count * 3);
+	if (Candidates.Num() == 0)
+	{
+		FOpenWorldScatterResult R;
+		R.bSuccess = false;
+		R.ErrorMessage = TEXT("No positions generated inside the zone");
+		return R;
+	}
+
+	return UOpenWorldFoliageService::ScatterWeightedInternal(
+		MeshPaths, MeshWeights, Candidates, Count, MinScale, MaxScale, bAlignToNormal, bRandomYaw, Seed, ActorLabel);
+}
+
+FOpenWorldZoneResult UOpenWorldZoneService::MoveZone(const FString& ZoneIdOrLabel, float DeltaX, float DeltaY)
+{
+	UWorld* World = GetZoneEditorWorld();
+	AZoneRegionActor* Target = FindZoneActor(World, ZoneIdOrLabel);
+	if (!Target)
+	{
+		return ZoneError(FString::Printf(TEXT("No zone found with id/label \"%s\""), *ZoneIdOrLabel));
+	}
+
+	for (FVector2D& P : Target->Zone.Points)
+	{
+		P.X += DeltaX;
+		P.Y += DeltaY;
+	}
+
+	// Re-trace the ground height at the new center.
+	{
+		FBox2D Bounds(ForceInit);
+		for (const FVector2D& P : Target->Zone.Points)
+		{
+			Bounds += P;
+		}
+		const FVector2D Center = Bounds.GetCenter();
+		if (World)
+		{
+			FCollisionQueryParams Params(SCENE_QUERY_STAT(OpenWorldZoneTrace), /*bTraceComplex=*/true);
+			FHitResult Hit;
+			const FVector Start(Center.X, Center.Y, 50000.f);
+			if (World->LineTraceSingleByChannel(Hit, Start, Start - FVector(0, 0, 100000.f), ECC_WorldStatic, Params))
+			{
+				Target->Zone.GroundZ = Hit.ImpactPoint.Z;
+			}
+		}
+	}
+
+	Target->SyncToZone();
+	Target->Modify();
+	return ZoneOk(TEXT("Zone moved"));
+}
+
+FOpenWorldLandscapeResult UOpenWorldZoneService::SculptInZone(
+	const FString& LandscapeName,
+	const FString& ZoneIdOrLabel,
+	const FString& Operation,
+	float HeightDelta,
+	float TargetHeight,
+	float Amplitude,
+	float Frequency,
+	float EdgeSoftness,
+	int32 Seed)
+{
+	UWorld* World = GetZoneEditorWorld();
+	AZoneRegionActor* Target = FindZoneActor(World, ZoneIdOrLabel);
+	if (!Target)
+	{
+		FOpenWorldLandscapeResult R;
+		R.bSuccess = false;
+		R.ErrorMessage = FString::Printf(TEXT("No zone found with id/label \"%s\""), *ZoneIdOrLabel);
+		return R;
+	}
+
+	// Zone footprint bounds (world X/Y).
+	FBox2D Bounds(ForceInit);
+	for (const FVector2D& P : Target->Zone.Points)
+	{
+		Bounds += P;
+	}
+	if (!Bounds.bIsValid)
+	{
+		FOpenWorldLandscapeResult R;
+		R.bSuccess = false;
+		R.ErrorMessage = TEXT("Zone has no valid points");
+		return R;
+	}
+
+	// Mask: inside the rect or inside the polygon.
+	const bool bIsPolygon = Target->Zone.bIsPolygon;
+	const TArray<FVector2D> Points = Target->Zone.Points;
+
+	const TFunction<bool(float WorldX, float WorldY)> Mask = [bIsPolygon, Points](float WorldX, float WorldY) -> bool
+	{
+		const FVector2D Point(WorldX, WorldY);
+		if (bIsPolygon)
+		{
+			return IsPointInPolygon(Point, Points);
+		}
+		if (Points.Num() < 2)
+		{
+			return false;
+		}
+		return Point.X >= Points[0].X && Point.X <= Points[1].X &&
+			Point.Y >= Points[0].Y && Point.Y <= Points[1].Y;
+	};
+
+	// Optionally feather the zone edge: expand mask boundary by EdgeSoftness with falloff.
+	const float Soft = FMath::Max(0.f, EdgeSoftness);
+	const TFunction<bool(float WorldX, float WorldY)> SoftMask =
+		[Soft, Mask, bIsPolygon, Points](float WorldX, float WorldY) -> bool
+	{
+		if (Soft <= 0.f)
+		{
+			return Mask(WorldX, WorldY);
+		}
+		if (Mask(WorldX, WorldY))
+		{
+			return true;
+		}
+		// Outside the zone: include a soft band up to EdgeSoftness away from the boundary.
+		const FVector2D Point(WorldX, WorldY);
+		float MinDist = TNumericLimits<float>::Max();
+		if (bIsPolygon)
+		{
+			for (int32 i = 0; i < Points.Num(); ++i)
+			{
+				const FVector2D A = Points[i];
+				const FVector2D B = Points[(i + 1) % Points.Num()];
+				const FVector2D AB = B - A;
+				const float LengthSq = AB.SizeSquared();
+				float T = 0.f;
+				if (LengthSq > SMALL_NUMBER)
+				{
+					T = FMath::Clamp(FVector2D::DotProduct(Point - A, AB) / LengthSq, 0.f, 1.f);
+				}
+				const FVector2D Closest = A + AB * T;
+				MinDist = FMath::Min(MinDist, FVector2D::Distance(Point, Closest));
+			}
+		}
+		else if (Points.Num() >= 2)
+		{
+			const FVector2D Min = Points[0];
+			const FVector2D Max = Points[1];
+			const float DX = FMath::Max(Min.X - Point.X, Point.X - Max.X);
+			const float DY = FMath::Max(Min.Y - Point.Y, Point.Y - Max.Y);
+			if (DX <= 0.f && DY <= 0.f)
+			{
+				return true;
+			}
+			MinDist = FMath::Sqrt(FMath::Max(DX, 0.f) * FMath::Max(DX, 0.f) + FMath::Max(DY, 0.f) * FMath::Max(DY, 0.f));
+		}
+		return MinDist <= Soft;
+	};
+
+	const FString OpName = Operation.ToUpper();
+
+	if (OpName == TEXT("SMOOTH"))
+	{
+		return UOpenWorldLandscapeService::SmoothMaskedHeights(
+			LandscapeName, Bounds.Min.X - Soft, Bounds.Min.Y - Soft, Bounds.Max.X + Soft, Bounds.Max.Y + Soft,
+			FMath::Max(1, FMath::RoundToInt(HeightDelta)), SoftMask);
+	}
+
+	// Pre-compute the zone's current average height (for Flatten/Ramp auto height).
+	float AverageZ = 0.f;
+	if (OpName == TEXT("FLATTEN") || OpName == TEXT("RAMP"))
+	{
+		if (TargetHeight != 0.f)
+		{
+			AverageZ = TargetHeight;
+		}
+		else
+		{
+			int32 SampleCount = 0;
+			FRandomStream AvgStream(12345);
+			for (int32 i = 0; i < 64; ++i)
+			{
+				const FVector2D P(
+					AvgStream.FRandRange(Bounds.Min.X, Bounds.Max.X),
+					AvgStream.FRandRange(Bounds.Min.Y, Bounds.Max.Y));
+				if (!Mask(P.X, P.Y))
+				{
+					continue;
+				}
+				FOpenWorldHeightResult H = UOpenWorldLandscapeService::GetHeightAtLocation(P.X, P.Y);
+				if (H.bSuccess)
+				{
+					AverageZ += H.Height;
+					++SampleCount;
+				}
+			}
+			if (SampleCount > 0)
+			{
+				AverageZ /= static_cast<float>(SampleCount);
+			}
+		}
+	}
+
+	const TFunction<float(float CurrentWorldZ, float WorldX, float WorldY)> Op =
+		[OpName, HeightDelta, AverageZ, Amplitude, Frequency, Seed,
+		Bounds, bIsPolygon, Points](float CurrentWorldZ, float WorldX, float WorldY) -> float
+	{
+		if (OpName == TEXT("FLATTEN"))
+		{
+			return AverageZ;
+		}
+		if (OpName == TEXT("RAISE"))
+		{
+			return CurrentWorldZ + HeightDelta;
+		}
+		if (OpName == TEXT("RAMP"))
+		{
+			// Linear tilt from AverageZ at the min edge to AverageZ+HeightDelta at the max edge.
+			float T = 0.f;
+			if (bIsPolygon)
+			{
+				FBox2D B(ForceInit);
+				for (const FVector2D& P : Points)
+				{
+					B += P;
+				}
+				T = B.Max.X > B.Min.X ? (WorldX - B.Min.X) / (B.Max.X - B.Min.X) : 0.f;
+			}
+			else
+			{
+				const FVector2D Min = Points[0];
+				const FVector2D Max = Points[1];
+				const float Width = FMath::Max(1.f, Max.X - Min.X);
+				T = (WorldX - Min.X) / Width;
+			}
+			return AverageZ + FMath::Clamp(T, 0.f, 1.f) * HeightDelta;
+		}
+		// NOISE
+		return CurrentWorldZ + UOpenWorldLandscapeService::Noise2D(WorldX * Frequency, WorldY * Frequency, Seed) * Amplitude;
+	};
+
+	return UOpenWorldLandscapeService::ApplyMaskedHeightOp(
+		LandscapeName, Bounds.Min.X - Soft, Bounds.Min.Y - Soft, Bounds.Max.X + Soft, Bounds.Max.Y + Soft, SoftMask, Op);
 }

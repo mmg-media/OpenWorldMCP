@@ -470,3 +470,140 @@ FOpenWorldLandscapeResult UOpenWorldLandscapeService::CreateMountain(
 			return Current + LocalHeight * Profile;
 		});
 }
+
+FOpenWorldLandscapeResult UOpenWorldLandscapeService::ApplyMaskedHeightOp(
+	const FString& LandscapeName,
+	float MinWorldX,
+	float MinWorldY,
+	float MaxWorldX,
+	float MaxWorldY,
+	const TFunction<bool(float WorldX, float WorldY)>& InMask,
+	const TFunction<float(float CurrentWorldZ, float WorldX, float WorldY)>& Op)
+{
+	ALandscape* Landscape = FindLandscape(LandscapeName);
+	if (!Landscape)
+	{
+		return LandscapeError(TEXT("Landscape not found"));
+	}
+
+	ULandscapeInfo* Info = Landscape->GetLandscapeInfo();
+	if (!Info)
+	{
+		return LandscapeError(TEXT("LandscapeInfo not available"));
+	}
+
+	const FVector Location = Landscape->GetActorLocation();
+	const FVector Scale = Landscape->GetActorScale3D();
+
+	const int32 MinX = FMath::FloorToInt((MinWorldX - Location.X) / Scale.X);
+	const int32 MinY = FMath::FloorToInt((MinWorldY - Location.Y) / Scale.Y);
+	const int32 MaxX = FMath::CeilToInt((MaxWorldX - Location.X) / Scale.X);
+	const int32 MaxY = FMath::CeilToInt((MaxWorldY - Location.Y) / Scale.Y);
+
+	FScopedTransaction Transaction(NSLOCTEXT("OpenWorldMCP", "MaskedHeightOp", "Masked Height Op"));
+
+	const float ZScale = Scale.Z;
+	const float TexToWorld = LANDSCAPE_ZSCALE * ZScale;
+	const float ActorZ = Location.Z;
+
+	return ApplyHeightOp(Landscape, Info, MinX, MinY, MaxX, MaxY,
+		[&](float Current, int32 VertexX, int32 VertexY) -> float
+		{
+			const float WorldX = Location.X + static_cast<float>(VertexX) * Scale.X;
+			const float WorldY = Location.Y + static_cast<float>(VertexY) * Scale.Y;
+
+			if (InMask && !InMask(WorldX, WorldY))
+			{
+				return Current;
+			}
+
+			const float CurrentWorldZ = ActorZ + (Current - LandscapeDataAccess::MidValue) * TexToWorld;
+			const float NewWorldZ = Op(CurrentWorldZ, WorldX, WorldY);
+			return (NewWorldZ - ActorZ) / TexToWorld + LandscapeDataAccess::MidValue;
+		});
+}
+
+FOpenWorldLandscapeResult UOpenWorldLandscapeService::SmoothMaskedHeights(
+	const FString& LandscapeName,
+	float MinWorldX,
+	float MinWorldY,
+	float MaxWorldX,
+	float MaxWorldY,
+	int32 Passes,
+	const TFunction<bool(float WorldX, float WorldY)>& InMask)
+{
+	ALandscape* Landscape = FindLandscape(LandscapeName);
+	if (!Landscape)
+	{
+		return LandscapeError(TEXT("Landscape not found"));
+	}
+
+	ULandscapeInfo* Info = Landscape->GetLandscapeInfo();
+	if (!Info)
+	{
+		return LandscapeError(TEXT("LandscapeInfo not available"));
+	}
+
+	const FVector Location = Landscape->GetActorLocation();
+	const FVector Scale = Landscape->GetActorScale3D();
+
+	const int32 MinX = FMath::FloorToInt((MinWorldX - Location.X) / Scale.X);
+	const int32 MinY = FMath::FloorToInt((MinWorldY - Location.Y) / Scale.Y);
+	const int32 MaxX = FMath::CeilToInt((MaxWorldX - Location.X) / Scale.X);
+	const int32 MaxY = FMath::CeilToInt((MaxWorldY - Location.Y) / Scale.Y);
+
+	const int32 SizeX = MaxX - MinX + 1;
+	const int32 SizeY = MaxY - MinY + 1;
+	if (SizeX < 3 || SizeY < 3)
+	{
+		return LandscapeOk();
+	}
+
+	FScopedTransaction Transaction(NSLOCTEXT("OpenWorldMCP", "SmoothMasked", "Smooth Heights"));
+
+	TArray<uint16> Heights;
+	ReadHeights(Info, MinX, MinY, MaxX, MaxY, Heights);
+
+	const int32 NumPasses = FMath::Clamp(Passes, 1, 8);
+	for (int32 Pass = 0; Pass < NumPasses; ++Pass)
+	{
+		TArray<uint16> Result;
+		Result.SetNumUninitialized(Heights.Num());
+
+		for (int32 Y = 0; Y < SizeY; ++Y)
+		{
+			for (int32 X = 0; X < SizeX; ++X)
+			{
+				const int32 Index = Y * SizeX + X;
+				Result[Index] = Heights[Index];
+
+				const float WorldX = Location.X + static_cast<float>(MinX + X) * Scale.X;
+				const float WorldY = Location.Y + static_cast<float>(MinY + Y) * Scale.Y;
+				if (InMask && !InMask(WorldX, WorldY))
+				{
+					continue;
+				}
+
+				const bool bHasLeft = X > 0;
+				const bool bHasRight = X < SizeX - 1;
+				const bool bHasTop = Y > 0;
+				const bool bHasBottom = Y < SizeY - 1;
+
+				float Sum = static_cast<float>(Heights[Index]);
+				int32 Count = 1;
+				if (bHasLeft) { Sum += Heights[Y * SizeX + (X - 1)]; ++Count; }
+				if (bHasRight) { Sum += Heights[Y * SizeX + (X + 1)]; ++Count; }
+				if (bHasTop) { Sum += Heights[(Y - 1) * SizeX + X]; ++Count; }
+				if (bHasBottom) { Sum += Heights[(Y + 1) * SizeX + X]; ++Count; }
+
+				Result[Index] = static_cast<uint16>(FMath::RoundToInt(Sum / static_cast<float>(Count)));
+			}
+		}
+		Heights = MoveTemp(Result);
+	}
+
+	CommitHeights(Landscape, Info, MinX, MinY, MaxX, MaxY, Heights.GetData());
+	Landscape->RequestLayersContentUpdate(ELandscapeLayerUpdateMode::Update_Heightmap_All);
+	FinalizeHeightEdit(Landscape);
+	return LandscapeOk();
+}

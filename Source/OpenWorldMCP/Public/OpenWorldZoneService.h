@@ -118,6 +118,79 @@ public:
 		int32 Seed = 0,
 		const FString& ActorLabel = TEXT("ScatteredMesh"));
 
+	/**
+	 * Scatter multiple meshes inside a zone with relative weights (e.g. a flower meadow:
+	 * grass 80%, flowers 10%, trees 10%). Each mesh is spawned as its own ISM actor.
+	 *
+	 * @param ZoneIdOrLabel - Zone id (e.g. "Zone_3") or zone label (e.g. "Wiese")
+	 * @param MeshWeightsCsv - "MeshPath1:Weight1;MeshPath2:Weight2;..." (e.g. "/PCG/.../Grass:80;/PCG/.../Flower:10;/PCG/.../Tree:10")
+	 * @param Count - Total number of instances to spawn across all meshes
+	 * @param MinScale - Minimum random scale
+	 * @param MaxScale - Maximum random scale
+	 * @param bAlignToNormal - Align instances to the surface normal
+	 * @param bRandomYaw - Random yaw rotation
+	 * @param Seed - Random seed for reproducibility (0 = random)
+	 * @param ActorLabel - Base label for the spawned ISM actors (suffixed per mesh)
+	 * @return Scatter result with spawned instance count
+	 */
+	UFUNCTION(BlueprintCallable, meta = (AICallable), Category = "OpenWorld|Zone")
+	static FOpenWorldScatterResult ScatterWeightedInZone(
+		const FString& ZoneIdOrLabel,
+		const FString& MeshWeightsCsv,
+		int32 Count,
+		float MinScale = 0.8f,
+		float MaxScale = 1.2f,
+		bool bAlignToNormal = true,
+		bool bRandomYaw = true,
+		int32 Seed = 0,
+		const FString& ActorLabel = TEXT("ScatteredMesh"));
+
+	/**
+	 * Move a zone by a world-space offset. Shifts all zone points and re-anchors the actor.
+	 *
+	 * @param ZoneIdOrLabel - Zone id or label
+	 * @param DeltaX - X offset in world units
+	 * @param DeltaY - Y offset in world units
+	 * @return Result
+	 */
+	UFUNCTION(BlueprintCallable, meta = (AICallable), Category = "OpenWorld|Zone")
+	static FOpenWorldZoneResult MoveZone(const FString& ZoneIdOrLabel, float DeltaX, float DeltaY);
+
+	/**
+	 * Sculpt the terrain inside a zone footprint with a selected operation.
+	 * Only vertices inside the zone (rect bounds or polygon) are affected; the zone edge
+	 * can be feathered with EdgeSoftness.
+	 *
+	 * Supported operations:
+	 *   "Flatten" - set height to TargetHeight (or the zone's average height if 0)
+	 *   "Raise"   - add HeightDelta (positive) / subtract (negative)
+	 *   "Noise"   - add Perlin-like noise (Amplitude/Frequency/Seed)
+	 *   "Ramp"    - tilt the zone linearly from TargetHeight at one edge to TargetHeight+HeightDelta at the other
+	 *   "Smooth"  - average each vertex with its neighbours (HeightDelta = number of passes)
+	 *
+	 * @param LandscapeName - Label or name of the landscape actor (empty = first found)
+	 * @param ZoneIdOrLabel - Zone id or label
+	 * @param Operation - One of: Flatten, Raise, Noise, Ramp, Smooth
+	 * @param HeightDelta - Raise amount / ramp height change / smooth passes
+	 * @param TargetHeight - Flatten/Ramp target height in world units (0 = auto/current average)
+	 * @param Amplitude - Noise amplitude in world units
+	 * @param Frequency - Noise frequency
+	 * @param EdgeSoftness - World-unit feather band around the zone edge (0 = hard edge)
+	 * @param Seed - Noise seed (0 = random)
+	 * @return Result
+	 */
+	UFUNCTION(BlueprintCallable, meta = (AICallable), Category = "OpenWorld|Zone")
+	static FOpenWorldLandscapeResult SculptInZone(
+		const FString& LandscapeName,
+		const FString& ZoneIdOrLabel,
+		const FString& Operation,
+		float HeightDelta = 0.f,
+		float TargetHeight = 0.f,
+		float Amplitude = 50.f,
+		float Frequency = 0.005f,
+		float EdgeSoftness = 100.f,
+		int32 Seed = 0);
+
 private:
 	static class UWorld* GetEditorWorld();
 };

@@ -114,7 +114,37 @@ public:
 		int32 Seed,
 		const FString& ActorLabel);
 
+	/**
+	 * Weighted multi-mesh scatter. Candidates are assigned to meshes according to their
+	 * relative weights, traced to the landscape, and spawned as one ISM actor per mesh.
+	 *
+	 * @param MeshPaths - Mesh paths with relative weights (parallel arrays)
+	 * @param MeshWeights - Relative weight per mesh (e.g. 80, 10, 10)
+	 * @param Candidates - Candidate world-space X/Y positions
+	 * @param Count - Total number of instances to spawn
+	 * @param MinScale - Minimum random scale
+	 * @param MaxScale - Maximum random scale
+	 * @param bAlignToNormal - Align instances to the surface normal
+	 * @param bRandomYaw - Random yaw rotation
+	 * @param Seed - Random seed for reproducibility (0 = random)
+	 * @param ActorLabel - Base label for the spawned ISM actors
+	 * @return Result with spawned instance count
+	 */
+	static FOpenWorldScatterResult ScatterWeightedInternal(
+		const TArray<FString>& MeshPaths,
+		const TArray<float>& MeshWeights,
+		const TArray<FVector2D>& Candidates,
+		int32 Count,
+		float MinScale,
+		float MaxScale,
+		bool bAlignToNormal,
+		bool bRandomYaw,
+		int32 Seed,
+		const FString& ActorLabel);
+
+	/** Trace straight down onto the landscape surface (shared with the zone tools). */
+	static bool TraceToLandscape(class UWorld* World, float X, float Y, FVector& OutLocation, FVector& OutNormal);
+
 private:
 	static class UWorld* GetEditorWorld();
-	static bool TraceToLandscape(class UWorld* World, float X, float Y, FVector& OutLocation, FVector& OutNormal);
 };

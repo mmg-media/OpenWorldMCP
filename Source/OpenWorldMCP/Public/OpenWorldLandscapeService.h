@@ -134,7 +134,38 @@ public:
 		float Height,
 		float Sharpness = 1.0f);
 
+	/**
+	 * Apply a per-vertex height operation inside a world-space rectangle, gated by a mask.
+	 * The op receives the current height in WORLD units plus the world X/Y, and returns the
+	 * new height in world units. Vertices whose mask returns false are left untouched.
+	 * Shared with the zone tools so terrain can be edited inside arbitrary footprints.
+	 */
+	static FOpenWorldLandscapeResult ApplyMaskedHeightOp(
+		const FString& LandscapeName,
+		float MinWorldX,
+		float MinWorldY,
+		float MaxWorldX,
+		float MaxWorldY,
+		const TFunction<bool(float WorldX, float WorldY)>& InMask,
+		const TFunction<float(float CurrentWorldZ, float WorldX, float WorldY)>& Op);
+
+	/**
+	 * Box-blur the terrain heights inside a world-space rectangle, gated by a mask.
+	 * Each pass averages a vertex with its 4 neighbours. Vertices whose mask returns false
+	 * keep their original height.
+	 */
+	static FOpenWorldLandscapeResult SmoothMaskedHeights(
+		const FString& LandscapeName,
+		float MinWorldX,
+		float MinWorldY,
+		float MaxWorldX,
+		float MaxWorldY,
+		int32 Passes,
+		const TFunction<bool(float WorldX, float WorldY)>& InMask);
+
+	/** Deterministic smooth Perlin-like noise in [-1,1]. */
+	static float Noise2D(float X, float Y, int32 Seed);
+
 private:
 	static class ALandscape* FindLandscape(const FString& LandscapeName);
-	static float Noise2D(float X, float Y, int32 Seed);
 };
