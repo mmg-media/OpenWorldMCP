@@ -15,8 +15,8 @@ void FOpenWorldMCPModule::StartupModule()
 	}
 	else
 	{
-		// The ToolsetRegistry is only available after engine init. Defer like the
-		// engine's own toolsets and VibeUE do.
+		// The ToolsetRegistry is only available after engine init, so defer registration
+		// until the engine startup has completed.
 		PostEngineInitHandle = FCoreDelegates::GetOnPostEngineInit().AddRaw(this, &FOpenWorldMCPModule::RegisterToolsets);
 	}
 }
